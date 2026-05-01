@@ -1,8 +1,10 @@
 local EventListener = require('ui/widget/eventlistener')
-local DataStorage = require('datastorage')
 local _ = require('gettext')
 local T = require('ffi/util').template
 local logger = require('logger')
+
+local lfs = require('libs/libkoreader-lfs')
+local socketutil = require('socketutil')
 
 local Files = require('karakeep/shared/files')
 local Notification = require('karakeep/shared/widgets/notification')
@@ -12,7 +14,7 @@ local Notification = require('karakeep/shared/widgets/notification')
 ---@field settings Settings Plugin settings instance
 local BookmarksToFolder = EventListener:extend({})
 
-local DEFAULT_EXPORT_DIR = DataStorage:getDataDir() .. '/books/karakeep'
+local DEFAULT_EXPORT_DIR = '/mnt/us/books/karakeep'
 
 -- KOReader's JSON library decodes null as a function sentinel
 local function normalizeNulls(tbl)
@@ -27,6 +29,112 @@ local function normalizeNulls(tbl)
         end
     end
     return tbl
+end
+
+local function escapeHtml(text)
+    if not text then
+        return ''
+    end
+    text = tostring(text)
+    text = text:gsub('&', '&amp;')
+    text = text:gsub('<', '&lt;')
+    text = text:gsub('>', '&gt;')
+    text = text:gsub('"', '&quot;')
+    return text
+end
+
+local imageCounter = 0
+
+local function downloadFile(url, dest_path)
+    local http = require('socket.http')
+    local socket = require('socket')
+    local response_body = {}
+    local request = {
+        url = url,
+        method = 'GET',
+        sink = socketutil.table_sink(response_body),
+    }
+    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+    local code = socket.skip(1, http.request(request))
+    socketutil:reset_timeout()
+    if code == 200 then
+        local f = io.open(dest_path, 'wb')
+        if f then
+            for _, chunk in ipairs(response_body) do
+                f:write(chunk)
+            end
+            f:close()
+            return true
+        end
+    end
+    return false
+end
+
+local function stripHtmlWrappers(html)
+    if not html then
+        return ''
+    end
+    local body_content = html:match('<body[^>]*>(.-)</body>')
+    if body_content then
+        return body_content
+    end
+    local cleaned = html
+    cleaned = cleaned:gsub('</?html[^>]*>', '')
+    cleaned = cleaned:gsub('</?head[^>]*>', '')
+    cleaned = cleaned:gsub('</?body[^>]*>', '')
+    cleaned = cleaned:gsub('<script[^>]*>.-</script>', '')
+    return cleaned
+end
+
+function BookmarksToFolder:downloadAndReplaceImages(html, export_dir)
+    local images_dir
+
+    local function getExt(url)
+        local ext = url:match('%.([%w]+)[?&#]') or url:match('%.([%w]+)$')
+        if ext and #ext <= 5 then
+            return ext:lower()
+        end
+        return 'jpg'
+    end
+
+    local function replaceImg(img_tag)
+        local src = img_tag:match('src%s*=%s*["\']([^"\']+)["\']')
+        if not src then
+            return img_tag
+        end
+        if src:match('^data:') then
+            return img_tag
+        end
+        if not src:match('^https?://') then
+            return img_tag
+        end
+
+        if not images_dir then
+            images_dir = export_dir .. '/images'
+            Files.createDirectories(images_dir)
+        end
+
+        imageCounter = imageCounter + 1
+        local ext = getExt(src)
+        local local_name = 'img_' .. string.format('%04d', imageCounter) .. '.' .. ext
+        local local_path = images_dir .. '/' .. local_name
+
+        if downloadFile(src, local_path) then
+            return img_tag:gsub('(src%s*=%s*["\'])[^"\']+(["\'])', '%1images/' .. local_name .. '%2')
+        end
+
+        return img_tag
+    end
+
+    return (html:gsub('<img[^>]*>', replaceImg))
+end
+
+function BookmarksToFolder:processContentHtml(htmlContent, export_dir)
+    local html = stripHtmlWrappers(htmlContent)
+    if not export_dir then
+        return html
+    end
+    return self:downloadAndReplaceImages(html, export_dir)
 end
 
 function BookmarksToFolder:getExportDir()
@@ -60,6 +168,7 @@ function BookmarksToFolder:exportBookmarksToFolder()
     while true do
         local query = {
             includeContent = true,
+            archived = false,
         }
         if cursor ~= nil then
             logger.dbg('[BookmarksToFolder] cursor type:', type(cursor), 'value:', cursor)
@@ -110,32 +219,60 @@ function BookmarksToFolder:exportBookmarksToFolder()
     end
 
     local saved = 0
+    local skipped = 0
     local errors = 0
 
     local saving = Notification:info(T(_('Saving %1 bookmarks...'), #all_bookmarks))
 
     for _, bm in ipairs(all_bookmarks) do
-        local filename = self:sanitizeFileName(bm.title or bm.id) .. '.txt'
+        local content, ext = self:formatBookmark(bm, export_dir)
+        local filename = self:sanitizeFileName(self:getBookmarkTitle(bm)) .. '.' .. ext
         local filepath = export_dir .. '/' .. filename
 
-        local content = self:formatBookmark(bm)
-        local write_ok, write_err = Files.writeFile(filepath, content)
-        if write_ok then
-            saved = saved + 1
+        if lfs.attributes(filepath, 'mode') then
+            skipped = skipped + 1
         else
-            errors = errors + 1
-            logger.err('[BookmarksToFolder] Failed to write', filepath, write_err and write_err.message)
+            local write_ok, write_err = Files.writeFile(filepath, content)
+            if write_ok then
+                saved = saved + 1
+            else
+                errors = errors + 1
+                logger.err('[BookmarksToFolder] Failed to write', filepath, write_err and write_err.message)
+            end
         end
     end
 
     saving:close()
 
     if saved > 0 then
-        Notification:success(T(_('Saved %1 bookmarks to %2'), saved, export_dir))
+        local msg = T(_('Saved %1 bookmarks to %2'), saved, export_dir)
+        if skipped > 0 then
+            msg = msg .. ' ' .. T(_('(%1 already existed)'), skipped)
+        end
+        Notification:success(msg)
+    elseif skipped > 0 then
+        Notification:info(T(_('All %1 bookmarks already exist in %2'), skipped, export_dir))
     end
     if errors > 0 then
         Notification:warn(T(_('Failed to save %1 bookmarks'), errors))
     end
+end
+
+function BookmarksToFolder:getBookmarkTitle(bm)
+    if bm.title and bm.title ~= '' then
+        return bm.title
+    end
+    local content = bm.content or {}
+    local ctype = content.type
+    if ctype == 'link' then
+        return content.title or content.url or bm.id
+    elseif ctype == 'text' then
+        local text = content.text or ''
+        return #text > 0 and text:gsub('%s+', ' '):match('^%s*(.-)%s*$'):sub(1, 50) or bm.id
+    elseif ctype == 'asset' then
+        return content.fileName or bm.id
+    end
+    return bm.id
 end
 
 function BookmarksToFolder:sanitizeFileName(name)
@@ -154,7 +291,74 @@ function BookmarksToFolder:sanitizeFileName(name)
     return safe
 end
 
-function BookmarksToFolder:formatBookmark(bm)
+function BookmarksToFolder:formatBookmark(bm, export_dir)
+    local content = bm.content or {}
+    local ctype = content.type
+
+    if ctype == 'link' then
+        return self:buildBookmarkHtml(bm, export_dir), 'html'
+    elseif ctype == 'text' then
+        return self:buildBookmarkText(bm), 'txt'
+    else
+        return self:buildBookmarkText(bm), 'txt'
+    end
+end
+
+function BookmarksToFolder:buildBookmarkHtml(bm, export_dir)
+    local parts = {}
+    local content = bm.content or {}
+
+    table.insert(parts, '<?xml version="1.0" encoding="utf-8"?>')
+    table.insert(parts, '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">')
+    table.insert(parts, '<html xmlns="http://www.w3.org/1999/xhtml">')
+    table.insert(parts, '<head>')
+    table.insert(parts, '<title>' .. escapeHtml(bm.title or bm.id) .. '</title>')
+    table.insert(parts, '<style>')
+    table.insert(parts, [[
+@page { margin: 0.3em 0; }
+html, body { margin: 0; padding: 0; font-size: 1em; }
+body { font-family: serif; line-height: 1.6; }
+img { max-width: 100%; height: auto; }
+h1 { border-bottom: 1px solid #ccc; padding-bottom: 0.3em; margin-top: 0; }
+.source { margin: 0.5em 0; }
+.content { border-top: 1px solid #ccc; padding-top: 0.5em; }
+.content img { max-width: 100%; height: auto; }
+pre { overflow-x: auto; white-space: pre-wrap; }
+]])
+    table.insert(parts, '</style>')
+    table.insert(parts, '</head>')
+    table.insert(parts, '<body>')
+
+    table.insert(parts, '<h1>' .. escapeHtml(bm.title or bm.id) .. '</h1>')
+
+    if content.url then
+        table.insert(parts, '<p class="source"><a href="' .. escapeHtml(content.url) .. '">' .. _('Source') .. '</a></p>')
+    end
+
+    if bm.note and bm.note ~= '' then
+        table.insert(parts, '<p><strong>Note:</strong><br/>' .. escapeHtml(bm.note) .. '</p>')
+    end
+    if bm.summary and bm.summary ~= '' then
+        table.insert(parts, '<p><strong>Summary:</strong><br/>' .. escapeHtml(bm.summary) .. '</p>')
+    end
+
+    if content.htmlContent then
+        table.insert(parts, '<div class="content">')
+        table.insert(parts, self:processContentHtml(content.htmlContent, export_dir))
+        table.insert(parts, '</div>')
+    elseif content.description then
+        table.insert(parts, '<div class="content">')
+        table.insert(parts, '<p>' .. escapeHtml(content.description) .. '</p>')
+        table.insert(parts, '</div>')
+    end
+
+    table.insert(parts, '</body>')
+    table.insert(parts, '</html>')
+
+    return table.concat(parts, '\n')
+end
+
+function BookmarksToFolder:buildBookmarkText(bm)
     local lines = {}
 
     table.insert(lines, 'Title: ' .. (bm.title or '(untitled)'))
@@ -177,9 +381,6 @@ function BookmarksToFolder:formatBookmark(bm)
         table.insert(lines, '---')
     end
 
-    table.insert(lines, '')
-    table.insert(lines, 'ID: ' .. bm.id)
-
     if bm.note and bm.note ~= '' then
         table.insert(lines, '')
         table.insert(lines, 'Note:')
@@ -191,20 +392,6 @@ function BookmarksToFolder:formatBookmark(bm)
         table.insert(lines, 'Summary:')
         table.insert(lines, bm.summary)
     end
-
-    if bm.tags and #bm.tags > 0 then
-        local tag_names = {}
-        for _, tag in ipairs(bm.tags) do
-            table.insert(tag_names, tag.name)
-        end
-        table.insert(lines, '')
-        table.insert(lines, 'Tags: ' .. table.concat(tag_names, ', '))
-    end
-
-    table.insert(lines, '')
-    table.insert(lines, 'Created: ' .. (bm.createdAt or 'unknown'))
-    table.insert(lines, 'Updated: ' .. (bm.modifiedAt or 'unknown'))
-    table.insert(lines, 'Favourited: ' .. tostring(bm.favourited or false))
 
     return table.concat(lines, '\n')
 end

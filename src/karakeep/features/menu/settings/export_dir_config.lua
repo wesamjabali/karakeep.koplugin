@@ -3,9 +3,8 @@ local InputDialog = require('ui/widget/inputdialog')
 local UIManager = require('ui/uimanager')
 
 local Notification = require('karakeep/shared/widgets/notification')
-local DataStorage = require('datastorage')
 
-local DEFAULT_EXPORT_DIR = DataStorage:getDataDir() .. '/books/karakeep'
+local DEFAULT_EXPORT_DIR = '/mnt/us/books/karakeep'
 
 ---@param karakeep Karakeep
 return function(karakeep)
