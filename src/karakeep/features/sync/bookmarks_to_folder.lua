@@ -14,6 +14,21 @@ local BookmarksToFolder = EventListener:extend({})
 
 local DEFAULT_EXPORT_DIR = DataStorage:getDataDir() .. '/books/karakeep'
 
+-- KOReader's JSON library decodes null as a function sentinel
+local function normalizeNulls(tbl)
+    if type(tbl) ~= 'table' then
+        return type(tbl) == 'function' and nil or tbl
+    end
+    for k, v in pairs(tbl) do
+        if type(v) == 'function' then
+            tbl[k] = nil
+        elseif type(v) == 'table' then
+            normalizeNulls(v)
+        end
+    end
+    return tbl
+end
+
 function BookmarksToFolder:getExportDir()
     local dir = self.settings and self.settings.export_dir
     if dir and dir ~= '' then
@@ -77,7 +92,7 @@ function BookmarksToFolder:exportBookmarksToFolder()
 
         local bookmarks = result.bookmarks or {}
         for _, bm in ipairs(bookmarks) do
-            table.insert(all_bookmarks, bm)
+            table.insert(all_bookmarks, normalizeNulls(bm))
         end
 
         cursor = type(result.nextCursor) == "string" and result.nextCursor or nil
@@ -124,7 +139,7 @@ function BookmarksToFolder:exportBookmarksToFolder()
 end
 
 function BookmarksToFolder:sanitizeFileName(name)
-    if not name or name == '' then
+    if not name or name == '' or type(name) ~= 'string' then
         return 'untitled'
     end
     local safe = name:gsub('[<>:"/\\|?*]', '_')
